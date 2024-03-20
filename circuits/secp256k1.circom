@@ -1,6 +1,6 @@
 pragma circom 2.0.2;
 
-include "../node_modules/circomlib/circuits/bitify.circom";
+include "../../circomlib/circuits/bitify.circom";
 
 include "bigint.circom";
 include "bigint_4x64_mult.circom";
@@ -310,6 +310,36 @@ template Secp256k1Double(n, k) {
     x3_eq_x1.out === 0;
 }
 
+template Secp256k1ScalarMultStep(n, k) {
+    signal input point[2][k];
+    signal input previous[2][k];
+    signal input n2b;
+    signal input has_prev_non_zero;
+    signal output out[2][k];
+
+    signal intermed[2][k];
+
+    component adder = Secp256k1AddUnequal(n, k);
+    component doubler = Secp256k1Double(n, k);
+    for (var idx = 0; idx < k; idx++) {
+        doubler.in[0][idx] <== previous[0][idx];
+        doubler.in[1][idx] <== previous[1][idx];
+    }
+    for (var idx = 0; idx < k; idx++) {
+        adder.a[0][idx] <== doubler.out[0][idx];
+        adder.a[1][idx] <== doubler.out[1][idx];
+        adder.b[0][idx] <== point[0][idx];
+        adder.b[1][idx] <== point[1][idx];
+    }
+    // partial = has_prev_non_zero * ((1 - n2b) * doubler + n2b * adder) + (1 - has_prev_non_zero) * point
+    for (var idx = 0; idx < k; idx++) {
+        intermed[0][idx] <== n2b * (adder.out[0][idx] - doubler.out[0][idx]) + doubler.out[0][idx];
+        intermed[1][idx] <== n2b * (adder.out[1][idx] - doubler.out[1][idx]) + doubler.out[1][idx];
+        out[0][idx] <== has_prev_non_zero * (intermed[0][idx] - point[0][idx]) + point[0][idx];
+        out[1][idx] <== has_prev_non_zero * (intermed[1][idx] - point[1][idx]) + point[1][idx];
+    }
+}
+
 template Secp256k1ScalarMult(n, k) {
     signal input scalar[k];
     signal input point[2][k];
@@ -338,9 +368,10 @@ template Secp256k1ScalarMult(n, k) {
     }
 
     signal partial[n * k][2][k];
-    signal intermed[n * k - 1][2][k];
-    component adders[n * k - 1];
-    component doublers[n * k - 1];
+    // signal intermed[n * k - 1][2][k];
+    // component adders[n * k - 1];
+    // component doublers[n * k - 1];
+    component steps[n * k - 1];
     for (var i = k - 1; i >= 0; i--) {
         for (var j = n - 1; j >= 0; j--) {
             if (i == k - 1 && j == n - 1) {
@@ -350,27 +381,40 @@ template Secp256k1ScalarMult(n, k) {
                 }
             }
             if (i < k - 1 || j < n - 1) {
-                adders[n * i + j] = Secp256k1AddUnequal(n, k);
-                doublers[n * i + j] = Secp256k1Double(n, k);
+                steps[n * i + j] = Secp256k1ScalarMultStep(n, k);
+                steps[n * i + j].n2b <== n2b[i].out[j];
+                steps[n * i + j].has_prev_non_zero <== has_prev_non_zero[n * i + j + 1].out;
                 for (var idx = 0; idx < k; idx++) {
-                    doublers[n * i + j].in[0][idx] <== partial[n * i + j + 1][0][idx];
-                    doublers[n * i + j].in[1][idx] <== partial[n * i + j + 1][1][idx];
+                    steps[n * i + j].point[0][idx] <== point[0][idx];
+                    steps[n * i + j].point[1][idx] <== point[1][idx];
+                    steps[n * i + j].previous[0][idx] <== partial[n * i + j + 1][0][idx];
+                    steps[n * i + j].previous[1][idx] <== partial[n * i + j + 1][0][idx];
                 }
                 for (var idx = 0; idx < k; idx++) {
-                    adders[n * i + j].a[0][idx] <== doublers[n * i + j].out[0][idx];
-                    adders[n * i + j].a[1][idx] <== doublers[n * i + j].out[1][idx];
-                    adders[n * i + j].b[0][idx] <== point[0][idx];
-                    adders[n * i + j].b[1][idx] <== point[1][idx];
+                    partial[n * i + j][0][idx] <== steps[n * i + j].out[0][idx];
+                    partial[n * i + j][1][idx] <== steps[n * i + j].out[1][idx];
                 }
-                // partial[n * i + j]
-                // = has_prev_non_zero[n * i + j + 1] * ((1 - n2b[i].out[j]) * doublers[n * i + j] + n2b[i].out[j] * adders[n * i + j])
-                //   + (1 - has_prev_non_zero[n * i + j + 1]) * point
-                for (var idx = 0; idx < k; idx++) {
-                    intermed[n * i + j][0][idx] <== n2b[i].out[j] * (adders[n * i + j].out[0][idx] - doublers[n * i + j].out[0][idx]) + doublers[n * i + j].out[0][idx];
-                    intermed[n * i + j][1][idx] <== n2b[i].out[j] * (adders[n * i + j].out[1][idx] - doublers[n * i + j].out[1][idx]) + doublers[n * i + j].out[1][idx];
-                    partial[n * i + j][0][idx] <== has_prev_non_zero[n * i + j + 1].out * (intermed[n * i + j][0][idx] - point[0][idx]) + point[0][idx];
-                    partial[n * i + j][1][idx] <== has_prev_non_zero[n * i + j + 1].out * (intermed[n * i + j][1][idx] - point[1][idx]) + point[1][idx];
-                }
+                // adders[n * i + j] = Secp256k1AddUnequal(n, k);
+                // doublers[n * i + j] = Secp256k1Double(n, k);
+                // for (var idx = 0; idx < k; idx++) {
+                //     doublers[n * i + j].in[0][idx] <== partial[n * i + j + 1][0][idx];
+                //     doublers[n * i + j].in[1][idx] <== partial[n * i + j + 1][1][idx];
+                // }
+                // for (var idx = 0; idx < k; idx++) {
+                //     adders[n * i + j].a[0][idx] <== doublers[n * i + j].out[0][idx];
+                //     adders[n * i + j].a[1][idx] <== doublers[n * i + j].out[1][idx];
+                //     adders[n * i + j].b[0][idx] <== point[0][idx];
+                //     adders[n * i + j].b[1][idx] <== point[1][idx];
+                // }
+                // // partial[n * i + j]
+                // // = has_prev_non_zero[n * i + j + 1] * ((1 - n2b[i].out[j]) * doublers[n * i + j] + n2b[i].out[j] * adders[n * i + j])
+                // //   + (1 - has_prev_non_zero[n * i + j + 1]) * point
+                // for (var idx = 0; idx < k; idx++) {
+                //     intermed[n * i + j][0][idx] <== n2b[i].out[j] * (adders[n * i + j].out[0][idx] - doublers[n * i + j].out[0][idx]) + doublers[n * i + j].out[0][idx];
+                //     intermed[n * i + j][1][idx] <== n2b[i].out[j] * (adders[n * i + j].out[1][idx] - doublers[n * i + j].out[1][idx]) + doublers[n * i + j].out[1][idx];
+                //     partial[n * i + j][0][idx] <== has_prev_non_zero[n * i + j + 1].out * (intermed[n * i + j][0][idx] - point[0][idx]) + point[0][idx];
+                //     partial[n * i + j][1][idx] <== has_prev_non_zero[n * i + j + 1].out * (intermed[n * i + j][1][idx] - point[1][idx]) + point[1][idx];
+                // }
             }
         }
     }
