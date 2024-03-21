@@ -340,11 +340,72 @@ template Secp256k1ScalarMultStep(n, k) {
     }
 }
 
-template Secp256k1ScalarMult(n, k) {
+// Execute Secp256k1ScalarMultStep by chunk_size times.
+// Note that n = n_chunks * chunk_size has two roles that are
+// easy to confuse:
+// 1. It is the number of bits for each limb in the big integer.
+// 2. It is the number of steps in the scalar multiplication.
+// Here we only split the number of steps into chunks. The limbs
+// are still n bits and are not changed at all.
+// Because n can be recovered from multiplying n_chunks and
+// chunk_size, we do not pass it as a parameter here.
+// To allow skipping some steps, we pass the number of steps
+// to skip as a parameter.
+template Secp256k1ScalarMultStepChunk(n_chunks, chunk_size, skips, k) {
+    var n_steps = chunk_size - skips;
+    signal input point[2][k]; // Still just one point
+    signal input previous[2][k]; // Still just one previous, because
+                                 // the previous input for other
+                                 // steps except the first one
+                                 // become intermediate
+    signal input n2b[n_steps];
+    signal input has_prev_non_zero[n_steps];
+    signal output out[2][k];
+
+    signal intermediate[2][k][n_steps-1];
+
+    var n = n_chunks * chunk_size;
+    component steps[n_steps];
+    for (var i = 0; i < n_steps; i++) {
+        steps[i] = Secp256k1ScalarMultStep(n, k);
+    }
+
+    for (var i = 0; i < n_steps; i++) {
+        // Prepare the inputs for the current step in the chunk
+        for (var idx = 0; idx < k; idx++) {
+            steps[i].point[0][idx] <== point[0][idx];
+            steps[i].point[1][idx] <== point[1][idx];
+            if (i == 0) {
+                steps[i].previous[0][idx] <== previous[0][idx];
+                steps[i].previous[1][idx] <== previous[1][idx];
+            } else {
+                steps[i].previous[0][idx] <== intermediate[0][idx][i-1];
+                steps[i].previous[1][idx] <== intermediate[1][idx][i-1];
+            }
+        }
+        steps[i].n2b <== n2b[i];
+        steps[i].has_prev_non_zero <== has_prev_non_zero[i];
+        // Must prepare all inputs first, when they are ready, then
+        // read the output.
+        for (var idx = 0; idx < k; idx++) {
+            if (i < n_steps-1) {
+                intermediate[0][idx][i] <== steps[i].out[0][idx];
+                intermediate[1][idx][i] <== steps[i].out[1][idx];
+            } else {
+                out[0][idx] <== steps[i].out[0][idx];
+                out[1][idx] <== steps[i].out[1][idx];
+            }
+        }
+    }
+}
+
+template Secp256k1ScalarMult(n_chunks, chunk_size, k) {
     signal input scalar[k];
     signal input point[2][k];
 
     signal output out[2][k];
+
+    var n = n_chunks * chunk_size;
 
     component n2b[k];
     for (var i = 0; i < k; i++) {
@@ -367,33 +428,47 @@ template Secp256k1ScalarMult(n, k) {
         }
     }
 
-    signal partial[n * k][2][k];
+    signal partial[n_chunks * k][2][k];
     // signal intermed[n * k - 1][2][k];
     // component adders[n * k - 1];
     // component doublers[n * k - 1];
-    component steps[n * k - 1];
+    component steps[n_chunks * k];
     for (var i = k - 1; i >= 0; i--) {
-        for (var j = n - 1; j >= 0; j--) {
-            if (i == k - 1 && j == n - 1) {
+        for (var j = n_chunks - 1; j >= 0; j--) {
+            if (i == k - 1 && j == n_chunks - 1) {
+                // For the very first chunk, we skip one step
+                steps[n_chunks * i + j] = Secp256k1ScalarMultStepChunk(n_chunks, chunk_size, 1, k);
                 for (var idx = 0; idx < k; idx++) {
-                    partial[n * i + j][0][idx] <== point[0][idx];
-                    partial[n * i + j][1][idx] <== point[1][idx];
+                    steps[n_chunks * i + j].point[0][idx] <== point[0][idx];
+                    steps[n_chunks * i + j].point[1][idx] <== point[1][idx];
+                    steps[n_chunks * i + j].previous[0][idx] <== point[0][idx];
+                    steps[n_chunks * i + j].previous[1][idx] <== point[1][idx];
                 }
-            }
-            if (i < k - 1 || j < n - 1) {
-                steps[n * i + j] = Secp256k1ScalarMultStep(n, k);
-                steps[n * i + j].n2b <== n2b[i].out[j];
-                steps[n * i + j].has_prev_non_zero <== has_prev_non_zero[n * i + j + 1].out;
-                for (var idx = 0; idx < k; idx++) {
-                    steps[n * i + j].point[0][idx] <== point[0][idx];
-                    steps[n * i + j].point[1][idx] <== point[1][idx];
-                    steps[n * i + j].previous[0][idx] <== partial[n * i + j + 1][0][idx];
-                    steps[n * i + j].previous[1][idx] <== partial[n * i + j + 1][0][idx];
+                for (var step = chunk_size - 2; step >= 0; step--) {
+                    steps[n_chunks * i + j].n2b[step] <== n2b[i].out[j * chunk_size + step];
+                    steps[n_chunks * i + j].has_prev_non_zero[step] <== has_prev_non_zero[n * i + j * chunk_size + step + 1].out;
                 }
                 for (var idx = 0; idx < k; idx++) {
-                    partial[n * i + j][0][idx] <== steps[n * i + j].out[0][idx];
-                    partial[n * i + j][1][idx] <== steps[n * i + j].out[1][idx];
+                    partial[n_chunks * i + j][0][idx] <== steps[n_chunks * i + j].out[0][idx];
+                    partial[n_chunks * i + j][1][idx] <== steps[n_chunks * i + j].out[1][idx];
                 }
+            } else { // if (i < k - 1 || j < n - 1)
+                steps[n_chunks * i + j] = Secp256k1ScalarMultStepChunk(n_chunks, chunk_size, 0, k);
+                for (var idx = 0; idx < k; idx++) {
+                    steps[n_chunks * i + j].point[0][idx] <== point[0][idx];
+                    steps[n_chunks * i + j].point[1][idx] <== point[1][idx];
+                    steps[n_chunks * i + j].previous[0][idx] <== partial[n_chunks * i + j + 1][0][idx];
+                    steps[n_chunks * i + j].previous[1][idx] <== partial[n_chunks * i + j + 1][1][idx];
+                }
+                for (var step = chunk_size - 1; step >= 0; step--) {
+                    steps[n_chunks * i + j].n2b[step] <== n2b[i].out[j * chunk_size + step];
+                    steps[n_chunks * i + j].has_prev_non_zero[step] <== has_prev_non_zero[n * i + j * chunk_size + step + 1].out;
+                }
+                for (var idx = 0; idx < k; idx++) {
+                    partial[n_chunks * i + j][0][idx] <== steps[n_chunks * i + j].out[0][idx];
+                    partial[n_chunks * i + j][1][idx] <== steps[n_chunks * i + j].out[1][idx];
+                }
+
                 // adders[n * i + j] = Secp256k1AddUnequal(n, k);
                 // doublers[n * i + j] = Secp256k1Double(n, k);
                 // for (var idx = 0; idx < k; idx++) {
