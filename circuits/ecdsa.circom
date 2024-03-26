@@ -126,7 +126,7 @@ template ECDSAPrivToPub(n, k) {
 // encoded with k registers of n bits each
 // signature is (r, s)
 // Does not check that pubkey is valid
-template ECDSAVerifyNoPubkeyCheck(n, k) {
+template ECDSAVerifyNoPubkeyCheck(n_chunks, chunk_size, k) {
     assert(k >= 2);
     assert(k <= 100);
 
@@ -137,6 +137,7 @@ template ECDSAVerifyNoPubkeyCheck(n, k) {
 
     signal output result;
 
+    var n = chunk_size * n_chunks;
     var p[100] = get_secp256k1_prime(n, k);
     var order[100] = get_secp256k1_order(n, k);
 
@@ -187,7 +188,7 @@ template ECDSAVerifyNoPubkeyCheck(n, k) {
     }
 
     // compute (r * sinv) * pubkey
-    component pubkey_mult = Secp256k1ScalarMult(n, k);
+    component pubkey_mult = Secp256k1ScalarMult(n_chunks, chunk_size, k);
     for (var idx = 0; idx < k; idx++) {
         pubkey_mult.scalar[idx] <== pubkey_coeff.out[idx];
         pubkey_mult.point[0][idx] <== pubkey[0][idx];
@@ -201,6 +202,145 @@ template ECDSAVerifyNoPubkeyCheck(n, k) {
         sum_res.a[1][idx] <== g_mult.pubkey[1][idx];
         sum_res.b[0][idx] <== pubkey_mult.out[0][idx];
         sum_res.b[1][idx] <== pubkey_mult.out[1][idx];
+    }
+
+    // compare sum_res.x with r
+    component compare[k];
+    signal num_equal[k - 1];
+    for (var idx = 0; idx < k; idx++) {
+        compare[idx] = IsEqual();
+        compare[idx].in[0] <== r[idx];
+        compare[idx].in[1] <== sum_res.out[0][idx];
+
+        if (idx > 0) {
+            if (idx == 1) {
+                num_equal[idx - 1] <== compare[0].out + compare[1].out;
+            } else {
+                num_equal[idx - 1] <== num_equal[idx - 2] + compare[idx].out;
+            }
+        }
+    }
+    component res_comp = IsEqual();
+    res_comp.in[0] <== k;
+    res_comp.in[1] <== num_equal[k - 2];
+    result <== res_comp.out;
+}
+
+// Split the ECDSAVerifyNoPubkeyCheck components.
+// The part before scalar mul is split into a separate
+// component. The part after scalar mul is split into another
+// component. The scalar mul is split into many small steps.
+// This is the first part.
+template ECDSAVerifyBeforeScalarMul(n, k) {
+    assert(k >= 2);
+    assert(k <= 100);
+
+    signal input r[k];
+    signal input s[k];
+    signal input msghash[k];
+    signal input pubkey[2][k];
+
+    signal output g_mult_out[2][k];
+    signal output n2b_out[k][n];
+    signal output has_prev_non_zero_out[k * n];
+
+    var p[100] = get_secp256k1_prime(n, k);
+    var order[100] = get_secp256k1_order(n, k);
+
+    // compute multiplicative inverse of s mod n
+    var sinv_comp[100] = mod_inv(n, k, s, order);
+    signal sinv[k];
+    component sinv_range_checks[k];
+    for (var idx = 0; idx < k; idx++) {
+        sinv[idx] <-- sinv_comp[idx];
+        sinv_range_checks[idx] = Num2Bits(n);
+        sinv_range_checks[idx].in <== sinv[idx];
+    }
+    component sinv_check = BigMultModP(n, k);
+    for (var idx = 0; idx < k; idx++) {
+        sinv_check.a[idx] <== sinv[idx];
+        sinv_check.b[idx] <== s[idx];
+        sinv_check.p[idx] <== order[idx];
+    }
+    for (var idx = 0; idx < k; idx++) {
+        if (idx > 0) {
+            sinv_check.out[idx] === 0;
+        }
+        if (idx == 0) {
+            sinv_check.out[idx] === 1;
+        }
+    }
+
+    // compute (h * sinv) mod n
+    component g_coeff = BigMultModP(n, k);
+    for (var idx = 0; idx < k; idx++) {
+        g_coeff.a[idx] <== sinv[idx];
+        g_coeff.b[idx] <== msghash[idx];
+        g_coeff.p[idx] <== order[idx];
+    }
+
+    // compute (h * sinv) * G
+    component g_mult = ECDSAPrivToPub(n, k);
+    for (var idx = 0; idx < k; idx++) {
+        g_mult.privkey[idx] <== g_coeff.out[idx];
+    }
+
+    // compute (r * sinv) mod n
+    component pubkey_coeff = BigMultModP(n, k);
+    for (var idx = 0; idx < k; idx++) {
+        pubkey_coeff.a[idx] <== sinv[idx];
+        pubkey_coeff.b[idx] <== r[idx];
+        pubkey_coeff.p[idx] <== order[idx];
+    }
+
+    component n2b[k];
+    for (var i = 0; i < k; i++) {
+        n2b[i] = Num2Bits(n);
+        n2b[i].in <== pubkey_coeff.out[i];
+        for (var j = 0; j < n; j++) {
+            n2b_out[i][j] <== n2b[i].out[j];
+        }
+    }
+
+    component has_prev_non_zero[k * n];
+    for (var i = k - 1; i >= 0; i--) {
+        for (var j = n - 1; j >= 0; j--) {
+            has_prev_non_zero[n * i + j] = OR();
+            if (i == k - 1 && j == n - 1) {
+                has_prev_non_zero[n * i + j].a <== 0;
+                has_prev_non_zero[n * i + j].b <== n2b[i].out[j];
+            } else {
+                has_prev_non_zero[n * i + j].a <== has_prev_non_zero[n * i + j + 1].out;
+                has_prev_non_zero[n * i + j].b <== n2b[i].out[j];
+            }
+            has_prev_non_zero_out[n * i + j] <== has_prev_non_zero[n * i + j].out;
+        }
+    }
+
+    for (var idx = 0; idx < k; idx++) {
+        g_mult_out[0][idx] <== g_mult.pubkey[0][idx];
+        g_mult_out[1][idx] <== g_mult.pubkey[1][idx];
+    }
+}
+
+// Now is the second part, the part after scalar mul
+template ECDSAVerifyAfterScalarMul(n, k) {
+    assert(k >= 2);
+    assert(k <= 100);
+
+    signal input r[k];
+    signal input g_mult_out[2][k];
+    signal input pubkey_mult_out[2][k];
+
+    signal output result;
+
+    // compute (h * sinv) * G + (r * sinv) * pubkey
+    component sum_res = Secp256k1AddUnequal(n, k);
+    for (var idx = 0; idx < k; idx++) {
+        sum_res.a[0][idx] <== g_mult_out[0][idx];
+        sum_res.a[1][idx] <== g_mult_out[1][idx];
+        sum_res.b[0][idx] <== pubkey_mult_out[0][idx];
+        sum_res.b[1][idx] <== pubkey_mult_out[1][idx];
     }
 
     // compare sum_res.x with r
