@@ -2,4 +2,4 @@ pragma circom 2.0.2;
 
 include "../../circuits/bigint.circom";
 
-component main {public [a, b]} = BigMultModP(64, 4);
+component main {public [a, b, p]} = BigMultModP(64, 4);

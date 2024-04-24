@@ -285,6 +285,11 @@ template ECDSAVerifyBeforeScalarMul(n, k) {
         g_mult.privkey[idx] <== g_coeff.out[idx];
     }
 
+    for (var idx = 0; idx < k; idx++) {
+        g_mult_out[0][idx] <== g_mult.pubkey[0][idx];
+        g_mult_out[1][idx] <== g_mult.pubkey[1][idx];
+    }
+
     // compute (r * sinv) mod n
     component pubkey_coeff = BigMultModP(n, k);
     for (var idx = 0; idx < k; idx++) {
@@ -315,11 +320,6 @@ template ECDSAVerifyBeforeScalarMul(n, k) {
             }
             has_prev_non_zero_out[n * i + j] <== has_prev_non_zero[n * i + j].out;
         }
-    }
-
-    for (var idx = 0; idx < k; idx++) {
-        g_mult_out[0][idx] <== g_mult.pubkey[0][idx];
-        g_mult_out[1][idx] <== g_mult.pubkey[1][idx];
     }
 }
 
