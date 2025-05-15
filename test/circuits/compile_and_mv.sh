@@ -10,7 +10,7 @@ fi
 circuit_name=$1
 
 # If the second parameter is provided, set rename_to as the second parameter
-rename_to = $circuit_name
+rename_to=$circuit_name
 if [ $# -gt 1 ]; then
   rename_to=$2
 fi
